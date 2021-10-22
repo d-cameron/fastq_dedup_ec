@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::{cmp::{self, Ordering}, collections::HashMap};
+
+use multimap::MultiMap;
 
 use debruijn::{Mer, Vmer, dna_string::DnaString, kmer::Kmer16};
 
@@ -18,22 +20,29 @@ type Kmer = Kmer16; // UPDATE NEXT LINE IF YOU CHANGE THIS
 const KMER_SIZE: usize = 16; // TODO: how do we access Kmer::_k()? DnaString::from_acgt_bytes(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").get_kmer::<Kmer>(0).len();
 pub struct DeduplicationLookup {
     pub seq: Vec<ConsensusSequence>,
-    lookup: [Vec<HashMap<Kmer, ConsensusSequenceId>>; 2],
+    lookup: [Vec<MultiMap<Kmer, ConsensusSequenceId>>; 2],
+    max_hamming_distance: HammingDistance,
+    max_phred_distance: PhredDistance,
+    max_per_base_phred_distance: PerBasePhredDistance,
 }
-const MAX_EDIT_DISTANCE: usize = 8;
-const MAX_PHRED_DISTANCE: usize = MAX_EDIT_DISTANCE * 42;
+type HammingDistance = u32;
+type PhredDistance = u32;
+type PerBasePhredDistance = f32;
 impl DeduplicationLookup {
     pub fn new() -> DeduplicationLookup {
         DeduplicationLookup {
             seq: vec![],
             lookup: [vec![], vec![]],
+            max_hamming_distance: 8,
+            max_phred_distance: 6 * 42,
+            max_per_base_phred_distance: 2.0,
         }
     }
     pub fn add_read_pair(&mut self, r1: DnaString, qual1: &[u8], r2: DnaString, qual2: &[u8]) -> ConsensusSequenceId {
         // find best candidate
-        match self.find_closest_consensus(r1, qual1, r2, qual2) {
-            Some((bestid, best_edit_distance, best_phred_distance)) => {
-                if self.seq[bestid as usize].add_read_pair(r1, qual1, r2, qual2) {
+        match self.find_closest_consensus(&r1, qual1, &r2, qual2) {
+            Some((bestid, _, _, _)) => {
+                if self.seq[bestid as usize].add_read_pair(&r1, qual1, &r2, qual2) {
                     self.update_lookup(bestid);
                 }
                 bestid
@@ -46,18 +55,65 @@ impl DeduplicationLookup {
             }
         }
     }
-    pub fn find_closest_consensus(&self, r1: DnaString, qual1: &[u8], r2: DnaString, qual2: &[u8]) -> Option<(ConsensusSequenceId, usize, usize)> {
+    pub fn find_closest_consensus(&self, r1: &DnaString, qual1: &[u8], r2: &DnaString, qual2: &[u8]) -> Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)> {
         let mut kmer_matches = HashMap::new();
-        // matching kmers
-        // ===================================
-        // ===================================
-        //   TODO: count matching kmers per consens
-        // ===================================
-        // ===================================
-
-        // ===================================
-        // Find the one with the lowest edit/phred distance
-        // ===================================
+        DeduplicationLookup::add_matching_kmers(&self.lookup[0], r1, &mut kmer_matches);
+        DeduplicationLookup::add_matching_kmers(&self.lookup[1], r2, &mut kmer_matches);
+        let mut best_match = None;
+        for id in kmer_matches.keys() {
+            // TODO: add fast exits
+            let edit_distance = DeduplicationLookup::calc_edit_distances(*id, &self.seq[*id as usize], &r1, qual1, &r2, qual2);
+            if edit_distance.1 < self.max_hamming_distance
+                    && edit_distance.2 < self.max_phred_distance
+                    && edit_distance.3 < self.max_per_base_phred_distance
+                    && DeduplicationLookup::best_id_cmp(best_match, Some(edit_distance)) == Ordering::Less {
+                best_match = Some(edit_distance);
+            }
+        }
+        best_match
+    }
+    fn calc_edit_distances(id: ConsensusSequenceId, consensus: &ConsensusSequence, r1: &DnaString, qual1: &[u8], r2: &DnaString, qual2: &[u8]) -> (ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance) {
+        let (edit_distance1, phred_distance1, shared_bases1) = DeduplicationLookup::calc_edit_distance(&consensus.seq[0], r1, qual1);
+        let (edit_distance2, phred_distance2, shared_bases2) = DeduplicationLookup::calc_edit_distance(&consensus.seq[1], r2, qual2);
+        (id, edit_distance1 + edit_distance2, phred_distance1 + phred_distance2, ((phred_distance1 + phred_distance2) as PerBasePhredDistance) / ((shared_bases1 + shared_bases2) as PerBasePhredDistance))
+    }
+    fn calc_edit_distance(seq: &DnaString, r: &DnaString, qual: &[u8]) -> (HammingDistance, PhredDistance, usize) {
+        let shared_bases = cmp::min(seq.len(), r.len());
+        let hamming = seq.slice(0, shared_bases).hamming_dist(&r.slice(0, shared_bases));
+        let mut phred_distance = 0;
+        for i in 0..shared_bases {
+            if seq.get(i) != r.get(i) {
+                phred_distance += (qual[i] - FASTQ_PHRED_ENCODING) as PhredDistance;
+            }
+        }
+        (hamming, phred_distance, shared_bases)
+    }
+    fn best_id_cmp(a: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>, b: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>) -> Ordering {
+        match (a, b) {
+            (None, None) => Ordering::Equal,
+            (None, Some(y)) => Ordering::Less,
+            (Some(y), None) => Ordering::Greater,
+            (Some((_, _, _, a_per_base_phred_errors)), Some((_, _, _, b_per_base_phred_errors))) =>
+            b_per_base_phred_errors.partial_cmp(&a_per_base_phred_errors).unwrap()
+        }
+    }
+    fn add_matching_kmers(lookup: &Vec<MultiMap<Kmer, ConsensusSequenceId>>, seq: &DnaString, counts: &mut HashMap<ConsensusSequenceId, u16>) {
+        let mut i = 0;
+        static EMPTY_LOOKUP : Vec<ConsensusSequenceId> = Vec::new();
+        while (i * KMER_SIZE) <= seq.len() {
+            let read_offset = i * KMER_SIZE;
+            let kmer: Kmer = seq.get_kmer(read_offset);
+            let consensuses_containing_kmer_at_position = lookup[i].get_vec(&kmer).unwrap_or(&EMPTY_LOOKUP);
+            // TODO: exclude consensus with too many matching kmers
+            for id in consensuses_containing_kmer_at_position {
+                if let Some(x) = counts.get_mut(id) {
+                    *x += 1;
+                } else {
+                    counts.insert(*id, 1);
+                }
+            }
+            i += 1;
+        }
     }
     /// Update the lookup for this consensus
     /// Implementation note: we don't know what's already in the lookup
@@ -69,9 +125,9 @@ impl DeduplicationLookup {
             DeduplicationLookup::update_lookup_read(&mut self.lookup[rindex], &self.seq[id as usize].seq[rindex], id);
         }
     }
-    fn update_lookup_read(lookup: &mut Vec<HashMap<Kmer16, ConsensusSequenceId>>, seq: &DnaString, id: ConsensusSequenceId) {
+    fn update_lookup_read(lookup: &mut Vec<MultiMap<Kmer, ConsensusSequenceId>>, seq: &DnaString, id: ConsensusSequenceId) {
         while lookup.len() * KMER_SIZE < seq.len() {
-            lookup.push(HashMap::new());
+            lookup.push(MultiMap::new());
         }
         let mut i = 0;
         while (i * KMER_SIZE) <= seq.len() {
@@ -121,12 +177,12 @@ impl ConsensusSequence {
         }
         out
     }
-    pub fn add_read_pair(&mut self, r1: DnaString, qual1: &[u8], r2: DnaString, qual2: &[u8]) -> bool {
+    pub fn add_read_pair(&mut self, r1: &DnaString, qual1: &[u8], r2: &DnaString, qual2: &[u8]) -> bool {
         self.reads += 1;
         // not using || shortcut since we always want to add both reads
         self.add_read(0, r1, qual1) | self.add_read(1, r2, qual2)
     }
-    pub fn add_read(&mut self, rindex: usize, r: DnaString, qual: &[u8]) -> bool {
+    pub fn add_read(&mut self, rindex: usize, r: &DnaString, qual: &[u8]) -> bool {
         let seq = &mut self.seq[rindex];
         let q = &mut self.basequals[rindex];
         let mut has_changed = false;
@@ -152,43 +208,17 @@ impl ConsensusSequence {
         has_changed
     }
 }
-/*
-// Decided I didn't like the needletail API (e.g. newline termination) and went with seq_io
-pub struct NeedleTailFastqIterator {
-    reader1: Box<dyn FastxReader>,
-    reader2: Box<dyn FastxReader>,
-}
-impl NeedleTailFastqIterator {
-    pub fn new_paired(file1 : &str, file2 : &str) -> Result<NeedleTailFastqIterator, ParseError> {
-        let reader1 = parse_fastx_file(file1)?;
-        let reader2 = parse_fastx_file(file2)?;
-        Ok(NeedleTailFastqIterator { reader1, reader2 })
+#[cfg(test)]
+mod tests {
+    use crate::*;
+    fn s(seq: &str) -> DnaString {
+        DnaString::from_acgt_bytes(seq.as_bytes())
     }
-    pub fn next(&mut self) -> Option<Result<(SequenceRecord, SequenceRecord), ParseError>> {
-        let rec1 = self.reader1.next();
-        let rec2 = self.reader2.next();
-        if rec1.is_none() && rec2.is_none() {
-            return None;
-        }
-        let seq1 = match rec1 {
-            None => {
-                let err_pos = ErrorPosition { id : None, line : self.reader1.position().line() };
-                let err = needletail::errors::ParseError::new_unexpected_end(err_pos, needletail::parser::Format::Fastq);
-                return Some(Err(err));
-            },
-            Some(Ok(x)) => x,
-            Some(Err(x)) => return Some(Err(x)),
-        };
-        let seq2 = match rec2 {
-            None => {
-                let err_pos = ErrorPosition { id : None, line : self.reader2.position().line() };
-                let err = needletail::errors::ParseError::new_unexpected_end(err_pos, needletail::parser::Format::Fastq);
-                return Some(Err(err));
-            },
-            Some(Ok(x)) => x,
-            Some(Err(x)) => return Some(Err(x)),
-        };
-        Some(Ok((seq1, seq2)))
+    #[test]
+    fn test_edit_distances() {
+        assert_eq!((1, 1, 4), DeduplicationLookup::calc_edit_distance(&s("ACGT"), &s("ACGA"), &[33,33,33,34]));
+        assert_eq!((1, 2, 4), DeduplicationLookup::calc_edit_distance(&s("ACGT"), &s("ACGA"), &[33,33,33,35]));
+        assert_eq!((2, 5, 4), DeduplicationLookup::calc_edit_distance(&s("ACGT"), &s("ACTA"), &[33,33,34,37]));
+        assert_eq!((1, 7, 3), DeduplicationLookup::calc_edit_distance(&s("ACG"), &s("ACTA"), &[33,33,40,37]));
     }
 }
-*/

@@ -8,4 +8,4 @@ edition = "2018"
 [dependencies]
 seq_io = "0.3.1"
 debruijn = "0.3.4"
-
+multimap = "0.8.3"
