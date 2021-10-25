@@ -26,10 +26,16 @@ struct Opts {
     max_per_base_phred_distance: f32,
     #[clap(long, default_value="6")]
     min_matching_kmers: u32,
+    #[clap(long, default_value="1024")]
+    uninformative_kmer_threshold: usize,
 }
 
 fn go(args : Opts) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut lookup = DeduplicationLookup::new();
+    lookup.max_hamming_distance = args.max_hamming_distance;
+    lookup.max_phred_distance = args.max_phred_distance;
+    lookup.max_per_base_phred_distance = args.max_per_base_phred_distance;
+    lookup.uninformative_kmer_threshold = args.uninformative_kmer_threshold;
     let mut mapping_writer = BufWriter::new(File::create(Path::new(&args.mapping))?);
     let mut reader1 = Reader::from_path(args.in1)?;
     let mut reader2 = Reader::from_path(args.in2)?;
@@ -84,6 +90,7 @@ mod tests {
             max_phred_distance: 150,
             max_per_base_phred_distance: 2.0,
             min_matching_kmers: 6,
+            uninformative_kmer_threshold: 1024,
         };
         go(args).unwrap();
     }
@@ -99,6 +106,7 @@ mod tests {
             max_phred_distance: 150,
             max_per_base_phred_distance: 2.0,
             min_matching_kmers: 6,
+            uninformative_kmer_threshold: 1024,
         };
         go(args).unwrap();
     }

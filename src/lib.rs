@@ -21,10 +21,11 @@ const KMER_SIZE: usize = 16; // TODO: how do we access Kmer::_k()? DnaString::fr
 pub struct DeduplicationLookup {
     pub seq: Vec<ConsensusSequence>,
     lookup: [Vec<MultiMap<Kmer, ConsensusSequenceId>>; 2],
-    max_hamming_distance: HammingDistance,
-    max_phred_distance: PhredDistance,
-    max_per_base_phred_distance: PerBasePhredDistance,
-    min_matching_kmers : u16,
+    pub max_hamming_distance: HammingDistance,
+    pub max_phred_distance: PhredDistance,
+    pub max_per_base_phred_distance: PerBasePhredDistance,
+    pub min_matching_kmers : u16,
+    pub uninformative_kmer_threshold: usize,
 }
 type HammingDistance = u32;
 type PhredDistance = u32;
@@ -38,6 +39,7 @@ impl DeduplicationLookup {
             max_phred_distance: 6 * 42,
             max_per_base_phred_distance: 2.0,
             min_matching_kmers: 4,
+            uninformative_kmer_threshold: 512,
         }
     }
     pub fn add_read_pair(&mut self, r1: DnaString, qual1: &[u8], r2: DnaString, qual2: &[u8]) -> ConsensusSequenceId {
@@ -61,14 +63,16 @@ impl DeduplicationLookup {
     }
     pub fn find_closest_consensus(&self, r1: &DnaString, qual1: &[u8], r2: &DnaString, qual2: &[u8]) -> Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)> {
         let mut kmer_matches = HashMap::new();
-        DeduplicationLookup::add_matching_kmers(&self.lookup[0], r1, &mut kmer_matches);
-        DeduplicationLookup::add_matching_kmers(&self.lookup[1], r2, &mut kmer_matches);
+        let mut uninformative_hits = 0;
+        uninformative_hits += self.add_matching_kmers(&self.lookup[0], r1, &mut kmer_matches);
+        uninformative_hits += self.add_matching_kmers(&self.lookup[1], r2, &mut kmer_matches);
         let mut best_match = None;
-        println!("ConsensusesWithHits={}", kmer_matches.len());
+        //println!("ConsensusesWithHits={}", kmer_matches.len());
         for (id, hits) in kmer_matches {
+            let hits = hits + uninformative_hits; // just assume everything matches for positions with many matches
             if hits > self.min_matching_kmers {
                 let edit_distance = self.calc_edit_distances(id, &self.seq[id as usize], &r1, qual1, &r2, qual2);
-                println!("edit_distance={},{},{}", edit_distance.1, edit_distance.2, edit_distance.3);
+                // println!("edit_distance={},{},{}", edit_distance.1, edit_distance.2, edit_distance.3);
                 if edit_distance.1 < self.max_hamming_distance
                         && edit_distance.2 < self.max_phred_distance
                         && edit_distance.3 < self.max_per_base_phred_distance
@@ -107,7 +111,9 @@ impl DeduplicationLookup {
             b_per_base_phred_errors.partial_cmp(&a_per_base_phred_errors).unwrap()
         }
     }
-    fn add_matching_kmers(lookup: &Vec<MultiMap<Kmer, ConsensusSequenceId>>, seq: &DnaString, counts: &mut HashMap<ConsensusSequenceId, u16>) {
+    // returns the number of uninformative positions that were skipped because there were too many matches consensuses
+    fn add_matching_kmers(&self, lookup: &Vec<MultiMap<Kmer, ConsensusSequenceId>>, seq: &DnaString, counts: &mut HashMap<ConsensusSequenceId, u16>) -> u16 {
+        let mut uninformative = 0;
         let mut i = 0;
         static EMPTY_LOOKUP : Vec<ConsensusSequenceId> = Vec::new();
         while (i + 1) * KMER_SIZE <= seq.len() && i < lookup.len() {
@@ -115,15 +121,20 @@ impl DeduplicationLookup {
             let kmer: Kmer = seq.get_kmer(read_offset);
             let consensuses_containing_kmer_at_position = lookup[i].get_vec(&kmer).unwrap_or(&EMPTY_LOOKUP);
             // TODO: exclude consensus with too many matching kmers
-            for id in consensuses_containing_kmer_at_position {
-                if let Some(x) = counts.get_mut(id) {
-                    *x += 1;
-                } else {
-                    counts.insert(*id, 1);
+            if consensuses_containing_kmer_at_position.len() > self.uninformative_kmer_threshold {
+                uninformative += 1;
+            } else {
+                for id in consensuses_containing_kmer_at_position {
+                    if let Some(x) = counts.get_mut(id) {
+                        *x += 1;
+                    } else {
+                        counts.insert(*id, 1);
+                    }
                 }
             }
             i += 1;
         }
+        uninformative
     }
     /// Update the lookup for this consensus
     /// Implementation note: we don't know what's already in the lookup
