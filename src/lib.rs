@@ -1,11 +1,11 @@
-use std::{cmp::{self, Ordering}, collections::HashMap};
-
+use std::{cmp::{self, Ordering}, collections::{hash_map::DefaultHasher}, hash::{Hash, Hasher}};
 use multimap::MultiMap;
-
-use debruijn::{Mer, Vmer, dna_string::DnaString, kmer::Kmer16};
+use rustc_hash::FxHashMap;
+use debruijn::{Mer, Vmer, dna_string::DnaString, kmer::{Kmer12}};
 
 // Enhancements:
-// - Ignore lookups with many kmer
+// - [done] Ignore lookups with many kmer
+// - [done] fast exact matching
 // - Collapse similar consensus sequences
 
 type BaseQualAccumulation = u32;
@@ -16,15 +16,16 @@ pub struct ConsensusSequence {
 }
 // Maximum number of unique sequences
 type ConsensusSequenceId = u32;
-type Kmer = Kmer16; // UPDATE NEXT LINE IF YOU CHANGE THIS
-const KMER_SIZE: usize = 16; // TODO: how do we access Kmer::_k()? DnaString::from_acgt_bytes(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").get_kmer::<Kmer>(0).len();
+type Kmer = Kmer12; // UPDATE NEXT LINE IF YOU CHANGE THIS
+const KMER_SIZE: usize = 12; // TODO: how do we access Kmer::_k()? DnaString::from_acgt_bytes(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").get_kmer::<Kmer>(0).len();
+const KMER_STRIDE: usize = KMER_SIZE;
 pub struct DeduplicationLookup {
     pub seq: Vec<ConsensusSequence>,
+    exact_lookup: FxHashMap<u64, ConsensusSequenceId>,
     lookup: [Vec<MultiMap<Kmer, ConsensusSequenceId>>; 2],
     pub max_hamming_distance: HammingDistance,
     pub max_phred_distance: PhredDistance,
     pub max_per_base_phred_distance: PerBasePhredDistance,
-    pub min_matching_kmers : u16,
     pub uninformative_kmer_threshold: usize,
 }
 type HammingDistance = u32;
@@ -34,11 +35,11 @@ impl DeduplicationLookup {
     pub fn new() -> DeduplicationLookup {
         DeduplicationLookup {
             seq: vec![],
+            exact_lookup: FxHashMap::default(),
             lookup: [vec![], vec![]],
             max_hamming_distance: 8,
             max_phred_distance: 6 * 42,
             max_per_base_phred_distance: 2.0,
-            min_matching_kmers: 4,
             uninformative_kmer_threshold: 512,
         }
     }
@@ -61,22 +62,49 @@ impl DeduplicationLookup {
             }
         }
     }
+    fn exact_hash_key(r1: &DnaString, r2: &DnaString) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        r1.hash(&mut hasher);
+        r2.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn min_hits_required(&self, r1len: usize, r2len: usize) -> u16 {
+        let r1kmers = 1 + (r1len - KMER_SIZE) / KMER_STRIDE;
+        let r2kmers = 1 + (r2len - KMER_SIZE) / KMER_STRIDE;
+        let kmers = r1kmers + r2kmers;
+        let allowable_errors = self.max_hamming_distance as usize;
+        let mismatched_kmers_per_error: usize = KMER_SIZE / std::cmp::min(KMER_STRIDE, KMER_SIZE);
+        let min_kmers = kmers - allowable_errors * mismatched_kmers_per_error;
+        min_kmers as u16
+    }
     pub fn find_closest_consensus(&self, r1: &DnaString, qual1: &[u8], r2: &DnaString, qual2: &[u8]) -> Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)> {
-        let mut kmer_matches = HashMap::new();
+        // Exact match
+        match self.exact_lookup.get(&DeduplicationLookup::exact_hash_key(r1, r2)) {
+            Some(exact_id) => {
+                let edit_distance = self.calc_edit_distances(*exact_id, &self.seq[*exact_id as usize], &r1, qual1, &r2, qual2);
+                if edit_distance.1 == 0 {
+                    return Some(edit_distance);
+                }
+            },
+            None => {},
+        };
+        // Find a match with errors allowed
+        let mut kmer_matches = FxHashMap::default();
         let mut uninformative_hits = 0;
         uninformative_hits += self.add_matching_kmers(&self.lookup[0], r1, &mut kmer_matches);
         uninformative_hits += self.add_matching_kmers(&self.lookup[1], r2, &mut kmer_matches);
         let mut best_match = None;
+        let min_hits_required = self.min_hits_required(r1.len(), r2.len());
         //println!("ConsensusesWithHits={}", kmer_matches.len());
         for (id, hits) in kmer_matches {
             let hits = hits + uninformative_hits; // just assume everything matches for positions with many matches
-            if hits > self.min_matching_kmers {
+            if hits >= min_hits_required {
                 let edit_distance = self.calc_edit_distances(id, &self.seq[id as usize], &r1, qual1, &r2, qual2);
                 // println!("edit_distance={},{},{}", edit_distance.1, edit_distance.2, edit_distance.3);
-                if edit_distance.1 < self.max_hamming_distance
-                        && edit_distance.2 < self.max_phred_distance
-                        && edit_distance.3 < self.max_per_base_phred_distance
-                        && DeduplicationLookup::best_id_cmp(best_match, Some(edit_distance)) == Ordering::Less {
+                if edit_distance.1 <= self.max_hamming_distance
+                        && edit_distance.2 <= self.max_phred_distance
+                        && edit_distance.3 <= self.max_per_base_phred_distance
+                        && self.cmp_distance_abundance(best_match, Some(edit_distance)) == Ordering::Less {
                     best_match = Some(edit_distance);
                 }
             }
@@ -102,22 +130,35 @@ impl DeduplicationLookup {
         }
         (phred_distance, shared_bases)
     }
-    fn best_id_cmp(a: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>, b: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>) -> Ordering {
+    /*
+    fn cmp_distance_per_base_phred(&self, a: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>, b: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>) -> Ordering {
         match (a, b) {
             (None, None) => Ordering::Equal,
             (None, Some(_)) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
-            (Some((_, _, _, a_per_base_phred_errors)), Some((_, _, _, b_per_base_phred_errors))) =>
+            (Some((_a_id, _a_hamming, _a_phred, a_per_base_phred_errors)),
+             Some((_b_id, _b_hamming, _b_phred, b_per_base_phred_errors))) =>
             b_per_base_phred_errors.partial_cmp(&a_per_base_phred_errors).unwrap()
         }
     }
-    // returns the number of uninformative positions that were skipped because there were too many matches consensuses
-    fn add_matching_kmers(&self, lookup: &Vec<MultiMap<Kmer, ConsensusSequenceId>>, seq: &DnaString, counts: &mut HashMap<ConsensusSequenceId, u16>) -> u16 {
+    */
+    fn cmp_distance_abundance(&self, a: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>, b: Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)>) -> Ordering {
+        match (a, b) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some((a_id, _a_hamming, _a_phred, _a_per_base_phred_errors)),
+             Some((b_id, _b_hamming, _b_phred, _b_per_base_phred_errors))) =>
+                self.seq[a_id as usize].read_count().partial_cmp(&self.seq[b_id as usize].read_count()).unwrap()
+        }
+    }
+    // returns the number of uninformative positions that were skipped because there were too many matching consensuses
+    fn add_matching_kmers(&self, lookup: &Vec<MultiMap<Kmer, ConsensusSequenceId>>, seq: &DnaString, counts: &mut FxHashMap<ConsensusSequenceId, u16>) -> u16 {
         let mut uninformative = 0;
         let mut i = 0;
         static EMPTY_LOOKUP : Vec<ConsensusSequenceId> = Vec::new();
-        while (i + 1) * KMER_SIZE <= seq.len() && i < lookup.len() {
-            let read_offset = i * KMER_SIZE;
+        while i * KMER_STRIDE + KMER_SIZE <= seq.len() && i < lookup.len() {
+            let read_offset = i * KMER_STRIDE;
             let kmer: Kmer = seq.get_kmer(read_offset);
             let consensuses_containing_kmer_at_position = lookup[i].get_vec(&kmer).unwrap_or(&EMPTY_LOOKUP);
             // TODO: exclude consensus with too many matching kmers
@@ -125,10 +166,13 @@ impl DeduplicationLookup {
                 uninformative += 1;
             } else {
                 for id in consensuses_containing_kmer_at_position {
-                    if let Some(x) = counts.get_mut(id) {
-                        *x += 1;
-                    } else {
-                        counts.insert(*id, 1);
+                    match counts.entry(*id) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            *entry.get_mut() += 1;
+                        },
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(1);
+                        },
                     }
                 }
             }
@@ -145,14 +189,15 @@ impl DeduplicationLookup {
         for rindex in [0, 1] {
             DeduplicationLookup::update_lookup_read(&mut self.lookup[rindex], &self.seq[id as usize].seq[rindex], id, false);
         }
+        self.exact_lookup.insert(DeduplicationLookup::exact_hash_key(&self.seq[id as usize].seq[0], &self.seq[id as usize].seq[0]), id);
     }
     fn update_lookup_read(lookup: &mut Vec<MultiMap<Kmer, ConsensusSequenceId>>, seq: &DnaString, id: ConsensusSequenceId, ensure_no_double_counting: bool) {
-        while lookup.len() * KMER_SIZE < seq.len() {
+        while lookup.len() * KMER_STRIDE + KMER_SIZE <= seq.len() {
             lookup.push(MultiMap::new());
         }
         let mut i = 0;
-        while (i + 1) * KMER_SIZE <= seq.len() {
-            let read_offset = i * KMER_SIZE;
+        while i * KMER_STRIDE + KMER_SIZE <= seq.len() {
+            let read_offset = i * KMER_STRIDE;
             let kmer: Kmer = seq.get_kmer(read_offset);
             match lookup[i].get_vec_mut(&kmer) {
                 Some(vector) if !ensure_no_double_counting || !vector.contains(&id) => {
@@ -431,5 +476,33 @@ mod tests {
                 assert_eq!(dna.slice(0, len).hamming_dist(&dnb.slice(0, len)), hamming_distance_common_bases(&dna, &dnb));
             }
         }
+    }
+    #[test]
+    fn cmp_distance_abundance() {
+        let mut lookup = DeduplicationLookup::new();
+        lookup.max_hamming_distance = 1;
+        lookup.add_read_pair(
+            s("AAAAAAAAAAAAAAAAT"),
+            "AAAAAAAAAAAAAAAAT".as_bytes(),
+            s("AAAAAAAAAAAAAAAAT"),
+            "AAAAAAAAAAAAAAAAT".as_bytes());
+        lookup.add_read_pair(
+            s("AAAAAAAAAAAAAAAAG"),
+            "AAAAAAAAAAAAAAAAA".as_bytes(),
+            s("AAAAAAAAAAAAAAAAG"),
+            "AAAAAAAAAAAAAAAAA".as_bytes());
+        lookup.add_read_pair(
+            s("AAAAAAAAAAAAAAAAG"),
+            "AAAAAAAAAAAAAAAAA".as_bytes(),
+            s("AAAAAAAAAAAAAAAAG"),
+            "AAAAAAAAAAAAAAAAA".as_bytes());
+        assert_eq!(2, lookup.seq.len());
+        lookup.add_read_pair(
+            s("AAAAAAAAAAAAAAAAT"),
+            "AAAAAAAAAAAAAAAAA".as_bytes(),
+            s("AAAAAAAAAAAAAAAAG"),
+            "AAAAAAAAAAAAAAAAA".as_bytes());
+        assert_eq!(Ordering::Less, lookup.cmp_distance_abundance(Some((0, 0, 0, 0.0)), Some((1, 1, 1, 1.0))));
+        assert_eq!(3, lookup.seq[1].read_count());
     }
 }
