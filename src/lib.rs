@@ -1,4 +1,4 @@
-use std::{cmp::{self, Ordering}, collections::{hash_map::DefaultHasher}, hash::{Hash, Hasher}};
+use std::{cell::RefCell, cmp::{self, Ordering}, collections::{hash_map::DefaultHasher}, hash::{Hash, Hasher}};
 use multimap::MultiMap;
 use rustc_hash::FxHashMap;
 use debruijn::{Mer, Vmer, dna_string::DnaString, kmer::{Kmer12}};
@@ -27,6 +27,7 @@ pub struct DeduplicationLookup {
     pub max_phred_distance: PhredDistance,
     pub max_per_base_phred_distance: PerBasePhredDistance,
     pub uninformative_kmer_threshold: usize,
+    pub debug_distances: Option<RefCell<Box<dyn std::io::Write>>>,
 }
 type HammingDistance = u32;
 type PhredDistance = u32;
@@ -41,6 +42,7 @@ impl DeduplicationLookup {
             max_phred_distance: 6 * 42,
             max_per_base_phred_distance: 2.0,
             uninformative_kmer_threshold: 512,
+            debug_distances: None,
         }
     }
     pub fn add_read_pair(&mut self, r1: DnaString, qual1: &[u8], r2: DnaString, qual2: &[u8]) -> ConsensusSequenceId {
@@ -71,22 +73,19 @@ impl DeduplicationLookup {
     fn min_hits_required(&self, r1len: usize, r2len: usize) -> u16 {
         let r1kmers = 1 + (r1len - KMER_SIZE) / KMER_STRIDE;
         let r2kmers = 1 + (r2len - KMER_SIZE) / KMER_STRIDE;
-        let kmers = r1kmers + r2kmers;
-        let allowable_errors = self.max_hamming_distance as usize;
-        let mismatched_kmers_per_error: usize = KMER_SIZE / std::cmp::min(KMER_STRIDE, KMER_SIZE);
+        let kmers = (r1kmers + r2kmers) as i32;
+        let allowable_errors = self.max_hamming_distance as i32;
+        let mismatched_kmers_per_error: i32 = KMER_SIZE as i32 / std::cmp::min(KMER_STRIDE, KMER_SIZE) as i32;
         let min_kmers = kmers - allowable_errors * mismatched_kmers_per_error;
-        min_kmers as u16
+        std::cmp::max(1, min_kmers) as u16
     }
     pub fn find_closest_consensus(&self, r1: &DnaString, qual1: &[u8], r2: &DnaString, qual2: &[u8]) -> Option<(ConsensusSequenceId, HammingDistance, PhredDistance, PerBasePhredDistance)> {
         // Exact match
-        match self.exact_lookup.get(&DeduplicationLookup::exact_hash_key(r1, r2)) {
-            Some(exact_id) => {
-                let edit_distance = self.calc_edit_distances(*exact_id, &self.seq[*exact_id as usize], &r1, qual1, &r2, qual2);
-                if edit_distance.1 == 0 {
-                    return Some(edit_distance);
-                }
-            },
-            None => {},
+        if let Some(exact_id) = self.exact_lookup.get(&DeduplicationLookup::exact_hash_key(r1, r2)) {
+            let edit_distance = self.calc_edit_distances(*exact_id, &self.seq[*exact_id as usize], &r1, qual1, &r2, qual2);
+            if edit_distance.1 == 0 {
+                return Some(edit_distance);
+            }
         };
         // Find a match with errors allowed
         let mut kmer_matches = FxHashMap::default();
@@ -101,11 +100,23 @@ impl DeduplicationLookup {
             if hits >= min_hits_required {
                 let edit_distance = self.calc_edit_distances(id, &self.seq[id as usize], &r1, qual1, &r2, qual2);
                 // println!("edit_distance={},{},{}", edit_distance.1, edit_distance.2, edit_distance.3);
+                let can_merge;
                 if edit_distance.1 <= self.max_hamming_distance
                         && edit_distance.2 <= self.max_phred_distance
-                        && edit_distance.3 <= self.max_per_base_phred_distance
-                        && self.cmp_distance_abundance(best_match, Some(edit_distance)) == Ordering::Less {
-                    best_match = Some(edit_distance);
+                        && edit_distance.3 <= self.max_per_base_phred_distance {
+                    can_merge = true;
+                    if self.cmp_distance_abundance(best_match, Some(edit_distance)) == Ordering::Less {
+                        best_match = Some(edit_distance);
+                    }
+                } else {
+                    can_merge = false;
+                }
+                if let Some(writer) = &self.debug_distances {
+                    let mut writer = writer.borrow_mut();
+                    let err = writeln!(writer, "{}\t{}\t{}\t{}\t{}", edit_distance.0, edit_distance.1, edit_distance.2, edit_distance.3, can_merge);
+                    if let Err(msg) = err {
+                        panic!("debug_distance error: {}", msg);
+                    }
                 }
             }
         }
@@ -208,6 +219,37 @@ impl DeduplicationLookup {
                 _ => {},
             }
             i += 1;
+        }
+    }
+    /// merges consensuses into more well-supported consensuses
+    pub fn merge_consenses(&mut self, max_distance: HammingDistance) {
+        let mut merge_order: Vec<(usize, u32)> = (0..self.seq.len())
+            .map(|i| (i, self.seq[i].reads))
+            .collect();
+        merge_order.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        for (id, count) in &merge_order {
+            let mut best_distance = max_distance + 1;
+            let mut best_id = id;
+            for (other_id, other_count) in &merge_order {
+                if other_count <= count {
+                    // early abort - only want to merge into better supported consensuses
+                    break;
+                }
+                if other_id == id {
+                    continue;
+                }
+                // TODO
+                let distance = (self.seq[*id].seq[0].hamming_distance(&self.seq[*other_id].seq[0]) + 
+                    self.seq[*id].seq[1].hamming_distance(&self.seq[*other_id].seq[1])) as HammingDistance;
+                if distance <= best_distance {
+                    best_id = other_id;
+                    best_distance = distance;
+                }
+            }
+            if best_id != id {
+                // TODO: MERGE
+                panic!("TODO: merge");
+            }
         }
     }
 }
